@@ -41,26 +41,8 @@ class Model:
         loss *= mask
         return tf.reduce_mean(loss)
 
-    def __get_accuracy(self, actual_batch, prediction_batch):
-        """Get the overall accuracy for a batch of actual and predicted values
-        
-        actual_batch shape: (batch size,),
-        prediction_batch shape: (batch size, vocab size)
-        """
-        # predicted_values = tf.math.argmax(prediction_batch)
-        # actual_batch_int = tf.cast(actual_batch, predicted_values.dtype)
-        
-        # correct_values = 0
-        # for i in range(actual_batch.shape[0]):
-        #     if actual_batch_int[i] == predicted_values[i]:
-        #         correct_values += 1
-        
-        # return correct_values / actual_batch.shape[0]
-        return 0
-
     def __evaluate(self, input_batch, target_batch, batch_size):
         total_loss = 0
-        total_accuracy = 0
         
         encoder_initial_state = tf.zeros((batch_size, self.encoder.units))
         encoder_output, encoder_state = self.encoder(
@@ -82,20 +64,17 @@ class Model:
             total_loss += self.__get_loss(
                 target_batch[:, i], predictions
             )
-            total_accuracy += self.__get_accuracy(target_batch[:, i], predictions)
 
             # Update decoder_input with current token
             decoder_input = tf.expand_dims(target_batch[:, i], 1)
 
         batch_loss = total_loss / target_batch.shape[1]
-        batch_accuracy = total_accuracy / target_batch.shape[1]
 
-        return batch_loss, batch_accuracy
+        return batch_loss
 
     @tf.function
     def __train_step(self, input_batch, target_batch, batch_size):
         total_loss = 0
-        total_accuracy = 0
         
         with tf.GradientTape() as tape:
             encoder_output, encoder_state = self.encoder(input_batch)
@@ -116,20 +95,18 @@ class Model:
                 total_loss += self.__get_loss(
                     target_batch[:, i], predictions
                 )
-                total_accuracy += self.__get_accuracy(target_batch[:, i], predictions)
 
                 # Update decoder_input with current token
                 decoder_input = tf.expand_dims(target_batch[:, i], 1)
 
         batch_loss = total_loss / target_batch.shape[1]
-        batch_accuracy = total_accuracy / target_batch.shape[1]
 
         variables = self.encoder.trainable_variables + \
             self.decoder.trainable_variables
         gradients = tape.gradient(total_loss, variables)
         self.optimizer.apply_gradients(zip(gradients, variables))
 
-        return batch_loss, batch_accuracy
+        return batch_loss
 
     def train(self, batch_size, val_batch_size, epochs):
         STEPS_PER_EPOCH = len(self.dataset.x_train) // batch_size
@@ -138,7 +115,6 @@ class Model:
             print(f"Training epoch {epoch}...")
 
             epoch_loss = 0
-            epoch_accuracy = 0
 
             batch_generator = self.__gen_batch(
                 self.dataset.x_train,
@@ -148,17 +124,15 @@ class Model:
             
             # For each batch of data
             for step_num, (input_batch, target_batch) in enumerate(batch_generator):
-                batch_loss, batch_accuracy = self.__train_step(
+                batch_loss = self.__train_step(
                     input_batch, target_batch, batch_size
                 )
 
                 epoch_loss += batch_loss
-                epoch_accuracy += batch_accuracy
             
             VAL_STEPS = len(self.dataset.x_test) // val_batch_size
 
             total_val_loss = 0
-            total_val_accuracy = 0
 
             val_batch_generator = self.__gen_batch(
                 self.dataset.x_test,
@@ -167,16 +141,13 @@ class Model:
                 shuffle=True
             )
             for (val_input_batch, val_target_batch) in val_batch_generator:
-                batch_loss, batch_accuracy = self.__evaluate(
+                batch_loss = self.__evaluate(
                     val_input_batch, val_target_batch, val_batch_size
                 )
                 total_val_loss += batch_loss
-                total_val_accuracy += batch_accuracy
             
             print(f"    Loss: {(epoch_loss / STEPS_PER_EPOCH):.2f}")
-            print(f"    Accuracy: {(epoch_accuracy / STEPS_PER_EPOCH):.2f}")
             print(f"    Validation loss: {(total_val_loss / VAL_STEPS):.2f}")
-            print(f"    Validation accuracy: {(total_val_accuracy / VAL_STEPS):.2f}\n")
 
     def predict(self, x, max_len):
         """Returns a predicted output sequence given sequence x"""
