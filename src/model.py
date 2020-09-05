@@ -5,49 +5,25 @@ import tensorflow as tf
 
 
 class Model:
-    def __init__(self, encoder, decoder, optimizer, loss_object):
+    def __init__(self, encoder, decoder, dataset, optimizer, loss_object):
         self.encoder = encoder
         self.decoder = decoder
+        self.dataset = dataset
         self.optimizer = optimizer
         self.loss_object = loss_object
 
-    def __max_list_len(self, lists):
-        """Return the length of the list inside lists with the
-        greatest length
-        """
-        max_len = -1
-        for inner_list in lists:
-            if len(inner_list) > max_len:
-                max_len = len(inner_list)
-        return max_len
-
     def __gen_batch(self, x, y, batch_size, shuffle=False):
         """Generate batches for model training"""
-        input_size = self.__max_list_len(x)
-        target_size = self.__max_list_len(y)
-
-        # Shuffle data
         if shuffle:
             data_pairs = list(zip(x, y))
             random.shuffle(data_pairs)
             x, y = zip(*data_pairs)
+            x = np.array(x)
+            y = np.array(y)
 
         # For each batch of data
-        for i in range(0, len(x), batch_size):
-            input_batch = np.zeros((batch_size, input_size))
-            target_batch = np.zeros((batch_size, target_size))
-
-            # For each x/y list in batch
-            for j in range(len(x[i:i + batch_size])):
-                # For each residue
-                for k, residue in enumerate(x[i]):
-                    input_batch[j, k] = residue
-                
-                # For each structure
-                for k, structure in enumerate(y[i]):
-                    target_batch[j, k] = structure
-                    
-            yield (input_batch, target_batch)
+        for i in range(0, len(x) - batch_size + 1, batch_size):
+            yield x[i:i + batch_size], y[i:i + batch_size]
 
     def __get_loss(self, actual_batch, prediction_batch):
         """Get the overall loss for a batch of actual and predicted values
@@ -57,12 +33,12 @@ class Model:
         """
         # Ignore padding
         # e.g. [[5], [6], [0]] -> [[True], [True], [False]]
-        # mask = tf.math.logical_not(tf.math.equal(actual_batch, 0))
+        mask = tf.math.logical_not(tf.math.equal(actual_batch, 0))
         
         loss = self.loss_object(actual_batch, prediction_batch)
         
-        # mask = tf.cast(mask, dtype=loss.dtype)
-        # loss *= mask
+        mask = tf.cast(mask, dtype=loss.dtype)
+        loss *= mask
         return tf.reduce_mean(loss)
 
     def __get_accuracy(self, actual_batch, prediction_batch):
@@ -82,102 +58,150 @@ class Model:
         # return correct_values / actual_batch.shape[0]
         return 0
 
+    def __evaluate(self, input_batch, target_batch, batch_size):
+        total_loss = 0
+        total_accuracy = 0
+        
+        encoder_initial_state = tf.zeros((batch_size, self.encoder.units))
+        encoder_output, encoder_state = self.encoder(
+            input_batch, encoder_initial_state
+        )
+        decoder_state = encoder_state
+
+        # Begin each input in batch with start ID
+        decoder_input = tf.expand_dims(
+            [self.dataset.start_token_id] * batch_size, 1
+        )
+
+        # For each token (excluding start)
+        for i in range(1, target_batch.shape[1]):
+            predictions, decoder_state, _ = self.decoder(
+                decoder_input, decoder_state, encoder_output
+            )
+
+            total_loss += self.__get_loss(
+                target_batch[:, i], predictions
+            )
+            total_accuracy += self.__get_accuracy(target_batch[:, i], predictions)
+
+            # Update decoder_input with current token
+            decoder_input = tf.expand_dims(target_batch[:, i], 1)
+
+        batch_loss = total_loss / target_batch.shape[1]
+        batch_accuracy = total_accuracy / target_batch.shape[1]
+
+        return batch_loss, batch_accuracy
+
     @tf.function
-    def __train_step(
-        self, input_batch, target_batch, start_token_id, batch_size
-    ):
-        loss = 0
-        accuracy = 0
+    def __train_step(self, input_batch, target_batch, batch_size):
+        total_loss = 0
+        total_accuracy = 0
         
         with tf.GradientTape() as tape:
             encoder_output, encoder_state = self.encoder(input_batch)
             
+            decoder_state = encoder_state
+
             # Begin each input in batch with start ID
             decoder_input = tf.expand_dims(
-                [start_token_id] * batch_size, 1
+                [self.dataset.start_token_id] * batch_size, 1
             )
 
             # For each token (excluding start)
             for i in range(1, target_batch.shape[1]):
                 predictions, decoder_state, _ = self.decoder(
-                    decoder_input, encoder_state, encoder_output
+                    decoder_input, decoder_state, encoder_output
                 )
 
-                loss += self.__get_loss(
+                total_loss += self.__get_loss(
                     target_batch[:, i], predictions
                 )
-                accuracy += self.__get_accuracy(target_batch[:, i], predictions)
+                total_accuracy += self.__get_accuracy(target_batch[:, i], predictions)
 
-                # Update targets with current token
+                # Update decoder_input with current token
                 decoder_input = tf.expand_dims(target_batch[:, i], 1)
 
-        batch_loss = loss / int(target_batch.shape[1])
-        batch_accuracy = accuracy / int(target_batch.shape[1])
+        batch_loss = total_loss / target_batch.shape[1]
+        batch_accuracy = total_accuracy / target_batch.shape[1]
 
         variables = self.encoder.trainable_variables + \
             self.decoder.trainable_variables
-        gradients = tape.gradient(loss, variables)
+        gradients = tape.gradient(total_loss, variables)
         self.optimizer.apply_gradients(zip(gradients, variables))
 
         return batch_loss, batch_accuracy
 
-    def train(self, x, y, batch_size, epochs, start_token_id):
-        steps_per_epoch = len(x) // batch_size
+    def train(self, batch_size, val_batch_size, epochs):
+        STEPS_PER_EPOCH = len(self.dataset.x_train) // batch_size
 
         for epoch in range(epochs):
-            loss = 0
-            accuracy = 0
+            print(f"Training epoch {epoch}...")
 
+            epoch_loss = 0
+            epoch_accuracy = 0
+
+            batch_generator = self.__gen_batch(
+                self.dataset.x_train,
+                self.dataset.y_train,
+                batch_size
+            )
+            
             # For each batch of data
-            for step_num, (input_batch, target_batch) in enumerate(
-                self.__gen_batch(x, y, batch_size)
-            ):
+            for step_num, (input_batch, target_batch) in enumerate(batch_generator):
                 batch_loss, batch_accuracy = self.__train_step(
-                    input_batch, target_batch, start_token_id, batch_size
+                    input_batch, target_batch, batch_size
                 )
 
-                loss += batch_loss
-                accuracy += batch_accuracy
-                
-                print(f"Epoch {epoch}, step {step_num} loss: {batch_loss:.2f}")
+                epoch_loss += batch_loss
+                epoch_accuracy += batch_accuracy
             
-            print(f"Epoch {epoch}:")
-            print(f"    Loss: {(loss / steps_per_epoch):.2f}")
-            print(f"    Accuracy: {(accuracy / steps_per_epoch):.2f}")
+            VAL_STEPS = len(self.dataset.x_test) // val_batch_size
 
-    def predict_random(self, x, y, start_token_id, end_token_id):
-        """Predicts the structures for a sequence randomly selected
-        from x
-        
-        Returns (prediction, input, target)
-        """
-        prediction = []
-        
-        input_sequence, target_sequence = next(self.__gen_batch(
-            x, y, batch_size=1, shuffle=True
-        ))
+            total_val_loss = 0
+            total_val_accuracy = 0
+
+            val_batch_generator = self.__gen_batch(
+                self.dataset.x_test,
+                self.dataset.y_test,
+                val_batch_size,
+                shuffle=True
+            )
+            for (val_input_batch, val_target_batch) in val_batch_generator:
+                batch_loss, batch_accuracy = self.__evaluate(
+                    val_input_batch, val_target_batch, val_batch_size
+                )
+                total_val_loss += batch_loss
+                total_val_accuracy += batch_accuracy
+            
+            print(f"    Loss: {(epoch_loss / STEPS_PER_EPOCH):.2f}")
+            print(f"    Accuracy: {(epoch_accuracy / STEPS_PER_EPOCH):.2f}")
+            print(f"    Validation loss: {(total_val_loss / VAL_STEPS):.2f}")
+            print(f"    Validation accuracy: {(total_val_accuracy / VAL_STEPS):.2f}\n")
+
+    def predict(self, x, max_len):
+        """Returns a predicted output sequence given sequence x"""
+        x = np.array([self.dataset.process_input_sequence(x)])
 
         encoder_initial_state = tf.zeros((1, self.encoder.units))
         encoder_output, encoder_state = self.encoder(
-            input_sequence, encoder_initial_state
+            x, encoder_initial_state
         )
 
-        decoder_input = tf.Variable([[start_token_id]])
+        decoder_state = encoder_state
+        decoder_input = tf.constant([[self.dataset.start_token_id]])
 
-        for i in range(input_sequence.shape[1]):
+        prediction = []
+
+        # Generate prediction until end token or max_len reached
+        for i in range(max_len):
             next_id_prediction, decoder_state, _ = self.decoder(
-                decoder_input, encoder_state, encoder_output
+                decoder_input, decoder_state, encoder_output 
             )
             predicted_id = tf.argmax(next_id_prediction[0]).numpy()
-            prediction.append(predicted_id)
-
-            if predicted_id == end_token_id:
+            if predicted_id == self.dataset.end_token_id:
                 break
 
-            decoder_input = tf.Variable([[predicted_id]])
-        
-        return \
-            prediction, \
-            input_sequence[0].astype(int).tolist(), \
-            target_sequence[0].astype(int).tolist()
+            prediction.append(self.dataset.id_to_y[predicted_id])
+            decoder_input = tf.constant([[predicted_id]])
 
+        return prediction
