@@ -73,7 +73,8 @@ def main():
         load_data(NUM_SEQUENCES)
     dataset = Dataset(
         x, y,
-        x_vocabulary=x_vocabulary, y_vocabulary=y_vocabulary
+        x_vocabulary=x_vocabulary, y_vocabulary=y_vocabulary,
+        test_size=TEST_PERCENT / 100
     )
 
     encoder = Encoder(
